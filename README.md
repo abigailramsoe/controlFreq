@@ -56,8 +56,8 @@ Each run produces:
 
 Contains aggregated taxonomic assignments for control libraries.
 
-### `Contamination report`
-reports/controlFreq_<timestamp>.html
+### Contamination report
+`reports/controlFreq_<timestamp>.html`
 
 Interactive HTML report containing:
 
