@@ -56,7 +56,6 @@ library(ggh4x)
 library(ggrepel)
 library(patchwork)
 library(vegan)
-
 ```
 
 # Data loading and filtering
@@ -81,18 +80,19 @@ datetime <- params$datetime
 
 dir.create(paste0("plots/", datetime), recursive = TRUE, showWarnings = FALSE)
 
+all_dates <- df %>%
+  filter(control_type != "Extraction_Positive") %>%
+  distinct(control_type, control_date)
+
 df_filt <- df %>%
   filter(
     control_type != "Extraction_Positive",
     
-    # EUKARYOTE rules
     (
       pipeline != "PREFILTER" &
       rank == eukaryote_rank &
       nreads > eukaryote_threshold
     ) |
-    
-    # PREFILTER rules
     (
       pipeline == "PREFILTER" &
       rank == prefilter_rank &
@@ -105,9 +105,41 @@ df_filt <- df %>%
       pipeline == "PREFILTER" ~ "Microbe",
       grepl("Metazoa", taxa_path) ~ "Animal",
       grepl("Viridiplantae", taxa_path) ~ "Plant",
-      TRUE ~ "Other"
+      TRUE ~ "Other_Euk"
     )
-  )
+  ) 
+```
+
+# Library count 
+
+This plot shows the number of control libraries processed each month, faceted by control type. This number may be 
+surprisingly small
+
+In order to appear in these plots, libraries must 
+
+* be identified by their robot_sample_id in SMDB (e.g. ExrNTC|LibNTC)
+* have a valid library_id from SMDB 
+* been run by a new (non "archive") version of the bioinformatics pipeline 
+
+
+```{r plot_library_count}
+
+total_ext <- all_dates %>%
+  filter(control_type == "Extraction_Negative") %>% pull() %>% length
+total_lib <- all_dates %>%
+  filter(control_type == "Library_Negative") %>% pull() %>% length
+  
+p <- all_dates %>%
+  mutate(month = format(control_date, "%Y-%m")) %>%
+  group_by(month, control_type) %>%
+  summarise(n_libraries = n(), .groups = "drop") %>%
+  ggplot(aes(month, n_libraries, fill = control_type)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~control_type) +
+  labs(x = "Month", y = "Number of Libraries", fill = "Control Type", 
+  title = paste0("Number of Control Libraries Processed Each Month: Extraction Negative = ", total_ext, ", Library Negative = ", total_lib)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+print(p)
 ```
 
 # Total contamination over time
@@ -121,13 +153,26 @@ Faceting by control type allows comparison between different types of laboratory
 ```{r plot_total_contamination}
 p <- df %>%
   filter(rank == "order" & control_type != "Extraction_Positive") %>% 
-  group_by(control_date, pipeline,control_type) %>%
+  group_by(control_date, pipeline, control_type) %>%
   summarise(total_reads = sum(nreads), .groups = "drop") %>%
+  
+  right_join(all_dates, by = c("control_type","control_date")) %>%
+  
+  tidyr::complete(control_type, control_date, pipeline,
+                  fill = list(total_reads = 0)) %>%
+  
   ggplot(aes(control_date, total_reads, colour = pipeline)) +
   geom_point(size = 3) +
   geom_line(linewidth = 1) +
-  scale_y_log10() + 
-  facet_wrap(~control_type) 
+  facet_wrap(~control_type, scales = "free_x") +
+  scale_x_date(date_labels = "%Y-%m") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    x = "Control Date",
+    y = "Total Reads",
+    colour = "Pipeline",
+    title = "Total Contamination Over Time"
+  )
 ggsave(paste0("plots/", datetime, "/total_contamination_over_time.png"), plot = p, width = 10, height = 6)
 print(p)
 ```
@@ -143,21 +188,33 @@ Rug marks along the bottom of the plot indicate the distribution of individual c
 
 ```{r plot_kingdom_composition}
 p <- df_filt %>%
-  mutate(
-    kingdom = case_when(
-      pipeline == "PREFILTER" ~ "Microbe",
-      grepl("Metazoa", taxa_path) ~ "Animal",
-      grepl("Viridiplantae", taxa_path) ~ "Plant",
-      TRUE ~ "Other_Euk"
-    )
-  ) %>%
   group_by(control_date, kingdom, control_type) %>%
   summarise(total = sum(nreads), .groups = "drop") %>%
   ggplot(aes(control_date, total, fill = kingdom)) +
-  geom_area(position = "fill") + 
-  facet_wrap(~control_type,scales="free") +
-  geom_rug(data = df_filt, aes(x = control_date), sides = "b", inherit.aes = FALSE)
-ggsave(paste0("plots/", datetime, "/kingdom_composition_over_time.png"), plot = p, width = 10, height = 6)
+  geom_area(position = "fill") +
+  facet_wrap(~control_type, scales = "free_x") +
+  geom_rug(
+    data = df_filt |> filter(!is.na(nreads)) |> distinct(control_type, control_date),
+    aes(x = control_date),
+    sides = "b",
+    inherit.aes = FALSE
+  ) +
+  scale_x_date(date_labels = "%Y-%m") +
+  labs(
+    x = "Control Date",
+    y = "Proportion of Reads",
+    fill = "Kingdom",
+    title = "Kingdom Composition of Contamination Over Time"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  paste0("plots/", datetime, "/kingdom_composition_over_time.png"),
+  plot = p,
+  width = 10,
+  height = 6
+)
+
 print(p)
 ```
 
@@ -170,18 +227,47 @@ This heatmap shows plant taxa detected in control libraries using the EUKARYOTE 
 Each row corresponds to a plant genus and each column corresponds to a control date. 
 Color intensity represents the logarithm of the number of reads assigned to that genus.
 
-```{r plot_plant_genus_heatmap}
-p <- df_filt %>% filter(kingdom == "Plant" & nreads > 49 & pipeline == "EUKARYOTE" ) %>%
-  group_by(control_date, name,control_type) %>%
-  summarise(nreads = sum(nreads), .groups = "drop") %>%
+In plants we just use the top 50 genera by total read count to keep the visualization interpretable.
+
+```{r plot_plant_genus_heatmap, fig.width=12, fig.height=12}
+top_genera <- df_filt %>%
+  filter(kingdom == "Plant") %>%
+  group_by(name) %>%
+  summarise(total_reads = sum(nreads), .groups = "drop") %>%
+  arrange(desc(total_reads)) %>%
+  slice_head(n = 50) %>%
+  pull(name)
+
+heatmap_data <- all_dates %>%
+  crossing(name = top_genera, .name_repair = "minimal") %>%
+  left_join(
+    df_filt %>%
+      filter(kingdom == "Plant", name %in% top_genera) %>%
+      group_by(control_date, name, control_type) %>%
+      summarise(nreads = sum(nreads), .groups = "drop"),
+    by = c("control_date", "name", "control_type")
+  ) 
+
+p <- heatmap_data %>%
   ggplot(aes(as.factor(control_date), name, fill = log10(nreads + 1))) +
   geom_tile() +
-  facet_wrap(~control_type) + 
-  scale_fill_viridis_c() +
-  labs(x = "Control Date", y = "Genus", fill = "Log10(Reads + 1)") +
-  ggtitle("Plant Genus-Level Contamination Over Time") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
-ggsave(paste0("plots/", datetime, "/plant_genus_heatmap.png"), plot = p, width = 10, height = 6)
+  facet_wrap(~control_type, scales = "free_x") +
+  scale_fill_viridis_c(na.value = NA) + 
+  labs(
+    x = "Control Date",
+    y = "Genus",
+    fill = "Log10(Reads + 1)",
+    title = "Plant Genus-Level Contamination Over Time"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  paste0("plots/", datetime, "/plant_genus_heatmap.png"),
+  plot = p,
+  width = 10,
+  height = 6
+)
+
 print(p)
 ```
 
@@ -190,17 +276,40 @@ print(p)
 This heatmap displays animal taxa detected in control libraries. 
 Similar to the plant heatmap, each tile shows the abundance of reads assigned to a particular genus at a given control date.
 
+We have the same 50 taxa limit for animals, though probably not needed.
 ```{r plot_animal_genus_heatmap}
-p <- df_filt %>% filter(kingdom == "Animal" & nreads > 49 & pipeline == "EUKARYOTE" ) %>%
-  group_by(control_date, name,control_type) %>%
-  summarise(nreads = sum(nreads), .groups = "drop") %>%
+
+top_genera <- df_filt %>%
+  filter(kingdom == "Animal") %>%
+  group_by(name) %>%
+  summarise(total_reads = sum(nreads), .groups = "drop") %>%
+  arrange(desc(total_reads)) %>%
+  slice_head(n = 50) %>%
+  pull(name)
+
+heatmap_data <- all_dates %>%
+  crossing(name = top_genera, .name_repair = "minimal") %>%
+  left_join(
+    df_filt %>%
+      filter(kingdom == "Animal", name %in% top_genera) %>%
+      group_by(control_date, name, control_type) %>%
+      summarise(nreads = sum(nreads), .groups = "drop"),
+    by = c("control_date", "name", "control_type")
+  ) 
+
+p <- heatmap_data %>%
   ggplot(aes(as.factor(control_date), name, fill = log10(nreads + 1))) +
   geom_tile() +
-  facet_wrap(~control_type) + 
-  scale_fill_viridis_c() +
-  labs(x = "Control Date", y = "Genus", fill = "Log10(Reads + 1)") +
-  ggtitle("Animal Genus-Level Contamination Over Time") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+  facet_wrap(~control_type, scales = "free_x") +
+  scale_fill_viridis_c(na.value = NA) + 
+  labs(
+    x = "Control Date",
+    y = "Genus",
+    fill = "Log10(Reads + 1)",
+    title = "Animal Genus-Level Contamination Over Time"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
 ggsave(paste0("plots/", datetime, "/animal_genus_heatmap.png"), plot = p, width = 10, height = 6)
 print(p)
 ```
@@ -211,16 +320,38 @@ This heatmap shows eukaryotic taxa that are neither classified as plants nor ani
 These may include fungi, protists, or other eukaryotic microorganisms.
 
 ```{r plot_other_eukaryote_genus_heatmap}
-p <- df_filt %>% filter(kingdom == "Other" & nreads > 49 & pipeline == "EUKARYOTE" ) %>%
-  group_by(control_date, name,control_type) %>%
-  summarise(nreads = sum(nreads), .groups = "drop") %>%
+
+top_genera <- df_filt %>%
+  filter(kingdom == "Other_Euk") %>%
+  group_by(name) %>%
+  summarise(total_reads = sum(nreads), .groups = "drop") %>%
+  arrange(desc(total_reads)) %>%
+  slice_head(n = 50) %>%
+  pull(name)
+
+heatmap_data <- all_dates %>%
+  crossing(name = top_genera, .name_repair = "minimal") %>%
+  left_join(
+    df_filt %>%
+      filter(kingdom == "Other_Euk", name %in% top_genera) %>%
+      group_by(control_date, name, control_type) %>%
+      summarise(nreads = sum(nreads), .groups = "drop"),
+    by = c("control_date", "name", "control_type")
+  ) 
+
+p <- heatmap_data %>%
   ggplot(aes(as.factor(control_date), name, fill = log10(nreads + 1))) +
   geom_tile() +
-  facet_wrap(~control_type) + 
-  scale_fill_viridis_c() +
-  labs(x = "Control Date", y = "Genus", fill = "Log10(Reads + 1)") +
-  ggtitle("Other Eukaryote Genus-Level Contamination Over Time") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+  facet_wrap(~control_type, scales = "free_x") +
+  scale_fill_viridis_c(na.value = NA) + 
+  labs(
+    x = "Control Date",
+    y = "Genus",
+    fill = "Log10(Reads + 1)",
+    title = "Other Eukaryote Genus-Level Contamination Over Time"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
 ggsave(paste0("plots/", datetime, "/other_eukaryote_genus_heatmap.png"), plot = p, width = 10, height = 6)
 print(p)
 ```
@@ -230,25 +361,39 @@ print(p)
 Bacterial assignments are far more numerous and diverse than eukaryotic taxa. 
 To keep the visualization interpretable, only the top 20 bacterial orders by total read count are displayed.
 
-```{r plot_bacteria_order_heatmap}
+```{r plot_bacteria_order_heatmap, fig.width=12, fig.height=12}
+
 top_orders <- df_filt %>% filter(kingdom == "Microbe") %>%
   group_by(name) %>%
   summarise(total_reads = sum(nreads), .groups = "drop") %>%
   arrange(desc(total_reads)) %>%
-  head(20) %>%
+  head(50) %>%
   pull(name)
+
+heatmap_data <- all_dates %>%
+  crossing(name = top_orders, .name_repair = "minimal") %>%
+  left_join(
+    df_filt %>%
+      filter(kingdom == "Microbe", name %in% top_orders) %>%
+      group_by(control_date, name, control_type) %>%
+      summarise(nreads = sum(nreads), .groups = "drop"),
+    by = c("control_date", "name", "control_type")
+  )
   
-p <- df_filt %>%
-  filter(name %in% top_orders) %>%
-  group_by(control_date, name, control_type) %>%
-  summarise(nreads = sum(nreads), .groups = "drop") %>%
+p <- heatmap_data %>%
   ggplot(aes(as.factor(control_date), name, fill = log10(nreads + 1))) +
   geom_tile() +
-  facet_wrap(~control_type) + 
-  scale_fill_viridis_c() +
-  labs(x = "Control Date", y = "Genus", fill = "Log10(Reads + 1)") +
-  ggtitle("Bacteria Order-Level Contamination Over Time (top 20 taxa)") +
+  facet_wrap(~control_type, scales = "free_x") +
+  scale_fill_viridis_c(na.value = NA) + 
+  labs(
+    x = "Control Date",
+    y = "Order",
+    fill = "Log10(Reads + 1)",
+    title = "Bacteria Order-Level Contamination Over Time"
+  ) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
 ggsave(paste0("plots/", datetime, "/bacteria_order_heatmap.png"), plot = p, width = 10, height = 6)
 print(p)
 ```
@@ -259,13 +404,25 @@ The distribution of read counts for each kingdom is summarized through time usin
 Each box represents a monthly distribution of read counts across control libraries.
 
 ```{r kingdom_reads_over_time}
+
+# Get valid month/control_type combinations from all_dates
+valid_combinations <- all_dates %>%
+  mutate(month = format(control_date, "%Y-%m")) %>%
+  distinct(month, control_type)
+
+# Create dummy data to establish x-axis positions
+dummy_data <- valid_combinations %>%
+  cross_join(df_filt %>% distinct(kingdom)) %>%
+  mutate(nreads = NA_real_)
+
+# Combine with actual data
 df_plot <- df_filt %>%
-  mutate(month = format(control_date, "%Y-%m"))
+  mutate(month = format(control_date, "%Y-%m")) %>%
+  bind_rows(dummy_data)
 
 p <- ggplot(df_plot, aes(month, nreads, fill = kingdom)) +
   geom_boxplot(outlier.alpha = 0.2) +
-  facet_grid(
-  kingdom ~ control_type  ) + 
+  facet_grid(kingdom ~ control_type, scales = "free_x", space = "free_x") +  
   scale_y_log10() +
   labs(
     x = "Month",
@@ -274,6 +431,7 @@ p <- ggplot(df_plot, aes(month, nreads, fill = kingdom)) +
     title = "Distribution of Reads per Kingdom Over Time"
   ) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
 ggsave(paste0("plots/", datetime, "/kingdom_reads_over_time.png"), plot = p, width = 10, height = 6)
 print(p)
 ```
@@ -418,7 +576,7 @@ with point size reflecting the number of reads.
 Comparing damage levels across taxa and control types can help identify whether certain contaminants display patterns 
 consistent with modern or degraded DNA.
 
-```{r plot_top_taxa_damage, fig.width=12, fig.height=12}
+```{r plot_top_taxa_damage, fig.width=12, fig.height=18, warning=FALSE}
 # top 20 taxa per kingdom
 top_taxa <- df_filt %>%
   group_by(kingdom,name) %>%
@@ -429,35 +587,90 @@ top_taxa <- df_filt %>%
   ungroup() %>%
   pull(name)
 
+
 p_animal <- df_filt %>%
   filter(name %in% top_taxa & kingdom == "Animal") %>%
   ggplot(aes(y = control_date, x = A, color = name, size = log10(nreads + 1))) +
   geom_point() + 
-  facet_grid(kingdom ~ control_type) +
+  facet_grid(~ control_type) +
   labs(x = "A (Damage)", y = "Control Date", color = "Taxon", size = "Log10(Reads + 1)") +
-  theme(legend.position = "bottom")
+  theme(legend.position = "bottom") +
+  geom_text_repel(
+      data = . %>% filter(A >= 0.1),
+      aes(label = name),
+      size = 6,
+      max.overlaps = 20,
+      show.legend = FALSE
+    ) 
 p_other <- df_filt %>%
-  filter(name %in% top_taxa & kingdom == "Other") %>%
+  filter(name %in% top_taxa & kingdom == "Other_Euk") %>%
   ggplot(aes(y = control_date, x = A, color = name, size = log10(nreads + 1))) +
   geom_point() + 
-  facet_grid(kingdom ~ control_type) +
+  facet_grid(~ control_type) +
   labs(x = "A (Damage)", y = "Control Date", color = "Taxon", size = "Log10(Reads + 1)") +
-  theme(legend.position = "bottom")
+  theme(legend.position = "bottom") +
+  geom_text_repel(
+      data = . %>% filter(A >= 0.1),
+      aes(label = name),
+      size = 6,
+      max.overlaps = 20,
+      show.legend = FALSE
+    ) 
 p_plant <- df_filt %>%
   filter(name %in% top_taxa & kingdom == "Plant") %>%
   ggplot(aes(y = control_date, x = A, color = name, size = log10(nreads + 1))) +
   geom_point() + 
-  facet_grid(kingdom ~ control_type) +
+  facet_grid(~ control_type) +
   labs(x = "A (Damage)", y = "Control Date", color = "Taxon", size = "Log10(Reads + 1)") +
-  theme(legend.position = "bottom")
+  theme(legend.position = "bottom") +
+  geom_text_repel(
+      data = . %>% filter(A >= 0.1),
+      aes(label = name),
+      size = 6,
+      max.overlaps = 20,
+      show.legend = FALSE
+    ) 
 p_mic <- df_filt %>%
   filter(name %in% top_taxa & kingdom == "Microbe") %>%
   ggplot(aes(y = control_date, x = A, color = name, size = log10(nreads + 1))) +
   geom_point() + 
-  facet_grid(kingdom ~ control_type) +
+  facet_grid(~ control_type) +
   labs(x = "A (Damage)", y = "Control Date", color = "Taxon", size = "Log10(Reads + 1)") +
-  theme(legend.position = "bottom")
+  theme(legend.position = "bottom") +
+  geom_text_repel(
+      data = . %>% filter(A >= 0.1),
+      aes(label = name),
+      size = 6,
+      max.overlaps = 20,
+      show.legend = FALSE
+    ) 
 p <- p_animal / p_plant / p_other / p_mic 
 ggsave(paste0("plots/", datetime, "/top_taxa_barplot.png"), plot = p, width = 10, height = 6)
+print(p)
+```
+
+Maybe tracking the damage through time of ALL taxa could be interesting, as it would 
+show if there are any taxa whose damage levels change through time, which could indicate changes 
+in contamination sources or degradation patterns.
+
+```{r plot_all_taxa_damage, fig.width=12, fig.height=18, warning=FALSE,message=FALSE}
+taxa_3_occ <- df_filt %>%
+  group_by(name) %>%
+  summarise(n_occ = sum(nreads > 0), .groups = "drop") %>%
+  filter(n_occ >= 3) %>%
+  pull(name)
+
+p <- df_filt %>%
+  filter(name %in% taxa_3_occ) %>%
+  ggplot(aes(y = control_date, x = A, color = kingdom, size = log10(nreads + 1))) +
+  geom_point() + 
+  facet_wrap(~ name) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", span = 1, orientation = "y") +
+  scale_y_date(limits = c(min(df_filt$control_date, na.rm = TRUE), 
+                          max(df_filt$control_date, na.rm = TRUE))) +
+  scale_x_continuous(limits = c(0, max(df_filt$A))) +
+  labs(x = "A (Damage)", y = "Control Date", color = "Kingdom", size = "Log10(Reads + 1)", title = "All Taxa Damage Over Time") +
+  theme(legend.position = "bottom") 
+ggsave(paste0("plots/", datetime, "/all_taxa_damage.png"), plot = p, width = 12, height = 12)
 print(p)
 ```
